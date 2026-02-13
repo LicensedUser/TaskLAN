@@ -1,99 +1,132 @@
-from flask import Flask, request, redirect, render_template_string
-from collections import deque
+import sqlite3
 import time
+from flask import Flask, request, redirect, render_template_string, jsonify
 
+DB = "tasks.db"
 app = Flask(__name__)
 
-queues = {
-    "A": deque(),
-    "B": deque(),
-    "C": deque()
-}
+def db():
+    return sqlite3.connect(DB, check_same_thread=False)
 
-running = {}
+def init_db():
+    with db() as c:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            worker TEXT,
+            command TEXT,
+            loop INTEGER,
+            delay INTEGER
+        )""")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS running (
+            id TEXT PRIMARY KEY,
+            worker TEXT,
+            command TEXT,
+            loop INTEGER,
+            delay INTEGER
+        )""")
+
+init_db()
 
 HTML = """
 <!doctype html>
 <title>LAN Task Server</title>
-<h2>📤 Add Task</h2>
 
+<h2>Add Task</h2>
 <form method="post" action="/add">
-  Task ID:<br>
-  <input name="id" required><br><br>
-
-  Command:<br>
-  <input name="command" size="80" required><br><br>
-
-  Worker:<br>
-  <select name="worker">
-    <option>A</option>
-    <option>B</option>
-    <option>C</option>
-  </select><br><br>
-
-  Loop:
-  <input type="checkbox" name="loop"><br><br>
-
-  Delay (seconds):
-  <input name="delay" value="0"><br><br>
-
-  <button type="submit">Add Task</button>
+ID:<br><input name="id" required><br>
+Command:<br><input name="command" size="80" required><br>
+Worker:<br>
+<select name="worker"><option>A</option><option>B</option><option>C</option></select><br>
+Loop <input type="checkbox" name="loop"><br>
+Delay <input name="delay" value="0"><br>
+<button>Add</button>
 </form>
 
 <hr>
 
-<h2>📋 Queues</h2>
-{% for w, q in queues.items() %}
-<h3>Worker {{w}}</h3>
+<h2>Queued</h2>
+{% for w in ["A","B","C"] %}
+<h3>{{w}}</h3>
 <ul>
-  {% for t in q %}
-    <li>{{t["id"]}} → {{t["command"]}}</li>
-  {% endfor %}
+{% for t in tasks if t["worker"]==w %}
+<li>{{t["id"]}} – {{t["command"]}}</li>
+{% endfor %}
 </ul>
 {% endfor %}
 
-<hr>
-
-<h2>⚙️ Running</h2>
+<h2>Running</h2>
 <ul>
-{% for t in running.values() %}
-  <li>{{t["id"]}} ({{t["worker"]}})</li>
+{% for r in running %}
+<li>{{r["id"]}} ({{r["worker"]}})</li>
 {% endfor %}
 </ul>
 """
 
 @app.route("/")
 def index():
-    return render_template_string(HTML, queues=queues, running=running)
+    with db() as c:
+        tasks = [dict(zip(
+            ["id","worker","command","loop","delay"], row
+        )) for row in c.execute("SELECT * FROM tasks")]
+        running = [dict(zip(
+            ["id","worker","command","loop","delay"], row
+        )) for row in c.execute("SELECT * FROM running")]
+
+    return render_template_string(HTML, tasks=tasks, running=running)
 
 @app.route("/add", methods=["POST"])
 def add():
-    task = {
-        "id": request.form["id"],
-        "command": request.form["command"],
-        "worker": request.form["worker"],
-        "loop": "loop" in request.form,
-        "delay": int(request.form["delay"] or 0)
-    }
-    queues[task["worker"]].append(task)
+    with db() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO tasks VALUES (?,?,?,?,?)",
+            (
+                request.form["id"],
+                request.form["worker"],
+                request.form["command"],
+                1 if "loop" in request.form else 0,
+                int(request.form["delay"] or 0)
+            )
+        )
     return redirect("/")
 
 @app.route("/task/<worker>")
 def get_task(worker):
-    if not queues[worker]:
-        return {}
-    task = queues[worker].popleft()
-    running[task["id"]] = task
-    return task
+    with db() as c:
+        row = c.execute(
+            "SELECT * FROM tasks WHERE worker=? LIMIT 1",
+            (worker,)
+        ).fetchone()
+
+        if not row:
+            return jsonify({})
+
+        c.execute("DELETE FROM tasks WHERE id=?", (row[0],))
+        c.execute("INSERT INTO running VALUES (?,?,?,?,?)", row)
+
+    return jsonify({
+        "id": row[0],
+        "worker": row[1],
+        "command": row[2],
+        "loop": bool(row[3]),
+        "delay": row[4]
+    })
 
 @app.route("/done", methods=["POST"])
 def done():
-    data = request.json
-    task = running.pop(data["id"], None)
+    tid = request.json["id"]
 
-    if task and task.get("loop"):
-        time.sleep(task["delay"])
-        queues[task["worker"]].append(task)
+    with db() as c:
+        row = c.execute(
+            "SELECT * FROM running WHERE id=?", (tid,)
+        ).fetchone()
+
+        c.execute("DELETE FROM running WHERE id=?", (tid,))
+
+        if row and row[3]:  # loop
+            time.sleep(row[4])
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?)", row)
 
     return {"status": "ok"}
 
